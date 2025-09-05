@@ -6,6 +6,7 @@
          'with_webp%': 'true',
          'with_bmp%':  'false',
          'with_raw%':  'true',
+         'with_blp%':  'true',
      },
     'targets': [{
         'target_name': 'binding',
@@ -49,6 +50,10 @@
             ['with_bmp=="true"', {
                 'defines': ['HAVE_BMP'],
                 'sources': ['src/Bmp.cc']
+            }],
+            ['with_blp=="true"', {
+                'defines': ['HAVE_BLP'],
+                'sources': ['src/Blp.cc']
             }],
             ['with_raw=="true"', {
                 'defines': ['HAVE_RAW'],

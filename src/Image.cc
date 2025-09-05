@@ -156,6 +156,7 @@ napi_value Image::Init(napi_env env, napi_value exports) { // {{{
     DEFINE_NAPI_CONSTANT("TYPE_JPEG", TYPE_JPEG);
     DEFINE_NAPI_CONSTANT("TYPE_GIF", TYPE_GIF);
     DEFINE_NAPI_CONSTANT("TYPE_BMP", TYPE_BMP);
+    DEFINE_NAPI_CONSTANT("TYPE_BLP", TYPE_BLP);
     DEFINE_NAPI_CONSTANT("TYPE_RAW", TYPE_RAW);
     DEFINE_NAPI_CONSTANT("TYPE_WEBP", TYPE_WEBP);
 
@@ -535,7 +536,8 @@ napi_value Image::LoadFromBuffer(napi_env env, napi_callback_info info) { // {{{
     Image *img;
 
     uint8_t *buffer;
-    uint32_t start, end, length;
+    uint32_t start, end;
+    size_t length;
 
     status = napi_unwrap(env, jsthis, reinterpret_cast<void**>(&img));
     assert(status == napi_ok);
@@ -544,7 +546,7 @@ napi_value Image::LoadFromBuffer(napi_env env, napi_callback_info info) { // {{{
     ImageDecoder decoder;
     ImageData input_data, *input;
 
-    status = napi_get_buffer_info(env, args[0], (void **) &buffer, (size_t *)&length);
+    status = napi_get_buffer_info(env, args[0], (void **) &buffer, &length);
     assert(status == napi_ok);
 
     start = 0;

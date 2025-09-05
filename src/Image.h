@@ -38,6 +38,7 @@ typedef enum {
     TYPE_JPEG,
     TYPE_GIF,
     TYPE_BMP,
+    TYPE_BLP,
     TYPE_RAW,
     TYPE_WEBP,
 } ImageType;
@@ -142,6 +143,10 @@ IMAGE_CODEC(Gif);
 IMAGE_CODEC(Bmp);
 #endif
 
+#ifdef HAVE_BLP
+IMAGE_CODEC(Blp);
+#endif
+
 #ifdef HAVE_RAW
 IMAGE_CODEC(Raw);
 #endif
@@ -226,6 +231,9 @@ class Image {
 #endif
 #ifdef HAVE_BMP
             regCodec(DECODER(Bmp), ENCODER(Bmp), TYPE_BMP);
+#endif
+#ifdef HAVE_BLP
+            regCodec(DECODER(Blp), ENCODER(Blp), TYPE_BLP);
 #endif
 #ifdef HAVE_GIF
             regCodec(DECODER(Gif), ENCODER(Gif), TYPE_GIF);

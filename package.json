@@ -5,6 +5,7 @@
   "main": "index.js",
   "types": "index.d.ts",
   "scripts": {
+    "build": "node-gyp rebuild",
     "test": "node test.js",
     "install": "node scripts/nothing.js"
   },
@@ -29,5 +30,8 @@
   "gypfile": true,
   "bugs": {
     "url": "https://github.com/zhangyuanwei/node-images/issues"
+  },
+  "devDependencies": {
+    "node-gyp": "^11.4.2"
   }
 }
