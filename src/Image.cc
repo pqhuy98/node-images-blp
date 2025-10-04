@@ -81,8 +81,8 @@
 #define DEFAULT_WIDTH_LIMIT  10240 // default limit 10000x10000
 #define DEFAULT_HEIGHT_LIMIT 10240 // default limit 10000x10000
 
-#define AdjustAmountOfExternalAllocatedMemory(bc) static_cast<int>( \
-        v8::Isolate::GetCurrent()->AdjustAmountOfExternalAllocatedMemory(bc));
+// Disable external memory accounting for Bun compatibility (avoids crashes during worker teardown)
+#define AdjustAmountOfExternalAllocatedMemory(bc) do { (void)(bc); } while(0)
 
 // Persistent<Function> Image::constructor;
 
