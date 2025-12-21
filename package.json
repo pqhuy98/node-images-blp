@@ -6,6 +6,8 @@
   "types": "index.d.ts",
   "scripts": {
     "build": "node-gyp rebuild",
+    "build-win": "node-gyp build && copy /Y build\\Release\\binding.node ..\\bin\\blp-preview\\win32-x64-binding.node",
+    "build-linux": "node-gyp build && cp build/Release/binding.node ../bin/blp-preview/linux-x64-binding.node",
     "test": "node test.js",
     "install": "node scripts/nothing.js"
   },

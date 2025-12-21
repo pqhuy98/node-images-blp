@@ -20,6 +20,124 @@ static void writeUInt32LE(uint8_t *dst, size_t offset, uint32_t value) {
     dst[offset + 3] = (uint8_t)((value >> 24) & 0xFF);
 }
 
+struct RgbF { float r, g, b; };
+
+static inline float dist2_srgb(float r1, float g1, float b1, float r2, float g2, float b2) {
+    // Perceptual weights (BT.709) in gamma-coded space (sRGB-like)
+    const float WR = 0.2126f, WG = 0.7152f, WB = 0.0722f;
+    float dr = r1 - r2;
+    float dg = g1 - g2;
+    float db = b1 - b2;
+    return WR * dr * dr + WG * dg * dg + WB * db * db;
+}
+
+static inline int lutIndex64(int r6, int g6, int b6) {
+    return (r6 << 12) | (g6 << 6) | b6;
+}
+
+static void buildLut64FromPalette(const uint8_t *palette /* 256*4 BGRA */, size_t paletteSize,
+                                 std::vector<RgbF> &paletteRgb,
+                                 std::vector<uint8_t> &lut /* 64^3 */) {
+    paletteRgb.clear();
+    paletteRgb.reserve(std::max((size_t)1, paletteSize));
+
+    size_t count = paletteSize;
+    if (count == 0) count = 1;
+    for (size_t i = 0; i < count; i++) {
+        size_t p = i * 4;
+        const float b = (float)palette[p + 0];
+        const float g = (float)palette[p + 1];
+        const float r = (float)palette[p + 2];
+        paletteRgb.push_back(RgbF{ r, g, b });
+    }
+
+    static const int LUTN = 64; // 6 bits/channel
+    const int LUT_SIZE = LUTN * LUTN * LUTN;
+    lut.assign(LUT_SIZE, 0);
+
+    for (int rr = 0; rr < LUTN; rr++) {
+        float r_srgb = (float)((rr << 2) | 2); // bucket midpoint in 0..255
+        for (int gg = 0; gg < LUTN; gg++) {
+            float g_srgb = (float)((gg << 2) | 2);
+            for (int bb = 0; bb < LUTN; bb++) {
+                float b_srgb = (float)((bb << 2) | 2);
+                int best = 0;
+                float bestD = 1e30f;
+                for (size_t k = 0; k < paletteRgb.size(); k++) {
+                    const auto &c = paletteRgb[k];
+                    float d = dist2_srgb(r_srgb, g_srgb, b_srgb, c.r, c.g, c.b);
+                    if (d < bestD) { bestD = d; best = (int)k; }
+                }
+                lut[lutIndex64(rr, gg, bb)] = (uint8_t)best;
+            }
+        }
+    }
+}
+
+static void mapToPaletteNoDither(PixelArray *input,
+                                const std::vector<uint8_t> &lut /* 64^3 */,
+                                uint8_t *indices /* width*height */,
+                                uint8_t *alpha /* width*height */) {
+    const size_t w = input->width;
+    const size_t h = input->height;
+    for (size_t y = 0; y < h; y++) {
+        Pixel *row = input->data[y];
+        for (size_t x = 0; x < w; x++) {
+            Pixel p = row[x];
+            alpha[y * w + x] = p.A;
+            const int r6 = ((int)p.R) >> 2;
+            const int g6 = ((int)p.G) >> 2;
+            const int b6 = ((int)p.B) >> 2;
+            indices[y * w + x] = lut[lutIndex64(r6, g6, b6)];
+        }
+    }
+}
+
+// Downsample by 2 with a simple 2x2 box filter, treating alpha as a separate mask channel:
+// - RGB is averaged without alpha-weighting
+// - Alpha is averaged independently
+// This matches the "resize RGB vs alpha separately" behavior used elsewhere in the toolchain.
+static ImageState downsample2x2SeparateAlpha(const PixelArray *src, PixelArray *dst) {
+    if (!src || !dst || !src->data || !dst->data) return FAIL;
+    if (src->width == 0 || src->height == 0 || dst->width == 0 || dst->height == 0) return FAIL;
+
+    const size_t sw = src->width;
+    const size_t sh = src->height;
+    const size_t dw = dst->width;
+    const size_t dh = dst->height;
+
+    for (size_t y = 0; y < dh; y++) {
+        for (size_t x = 0; x < dw; x++) {
+            const size_t sx0 = std::min(sw - 1, x * 2);
+            const size_t sy0 = std::min(sh - 1, y * 2);
+            const size_t sx1 = std::min(sw - 1, sx0 + 1);
+            const size_t sy1 = std::min(sh - 1, sy0 + 1);
+
+            const Pixel p00 = src->data[sy0][sx0];
+            const Pixel p10 = src->data[sy0][sx1];
+            const Pixel p01 = src->data[sy1][sx0];
+            const Pixel p11 = src->data[sy1][sx1];
+
+            const uint32_t sumA = (uint32_t)p00.A + (uint32_t)p10.A + (uint32_t)p01.A + (uint32_t)p11.A;
+            const uint32_t sumR = (uint32_t)p00.R + (uint32_t)p10.R + (uint32_t)p01.R + (uint32_t)p11.R;
+            const uint32_t sumG = (uint32_t)p00.G + (uint32_t)p10.G + (uint32_t)p01.G + (uint32_t)p11.G;
+            const uint32_t sumB = (uint32_t)p00.B + (uint32_t)p10.B + (uint32_t)p01.B + (uint32_t)p11.B;
+
+            uint32_t outA = (sumA + 2) / 4; // average alpha (rounded)
+            uint32_t outR = (sumR + 2) / 4;
+            uint32_t outG = (sumG + 2) / 4;
+            uint32_t outB = (sumB + 2) / 4;
+
+            Pixel &d = dst->data[y][x];
+            d.R = (uint8_t)std::min(255u, outR);
+            d.G = (uint8_t)std::min(255u, outG);
+            d.B = (uint8_t)std::min(255u, outB);
+            d.A = (uint8_t)std::min(255u, outA);
+        }
+    }
+    return SUCCESS;
+}
+
 // High-quality, fast quantization: k-means on sampled pixels + 5-5-5 LUT mapping
 // - Operates in linear RGB for perceptual accuracy (convert from sRGB)
 // - Sample up to SAMPLE_MAX non-transparent pixels
@@ -267,7 +385,7 @@ DECODER_FN(Blp) {
 }
 
 ENCODER_FN(Blp) {
-    // Encode PixelArray into BLP1 (palette with 8-bit alpha), mip0 only
+    // Encode PixelArray into BLP1 (palette with 8-bit alpha), mip0 up to mip15
     if (!input || !output) return FAIL;
 
     const size_t w = input->width;
@@ -290,8 +408,47 @@ ENCODER_FN(Blp) {
     size_t paletteSize = 0;
     quantize_kmeans(input, palette, &paletteSize, indices, alpha);
 
+    // Build palette LUT once, reuse for all mip levels
+    std::vector<RgbF> paletteRgb;
+    std::vector<uint8_t> lut64;
+    buildLut64FromPalette(palette, paletteSize, paletteRgb, lut64);
+
+    // Plan mip sizes and compute total output size.
+    // Important: for POT textures, WebGL/OpenGL require a complete mip chain down to 1x1 when using mipmapped minification.
+    // mdx-m3-viewer switches to LINEAR_MIPMAP_LINEAR when the file reports >1 mip, so we must not truncate the chain.
+    const size_t HEADER_SIZE = 156; // BLP1 header: 7*4 + 16*4 offsets + 16*4 sizes
+    const size_t PALETTE_BYTES = 256 * 4;
+    const int MAX_MIP_COUNT = 16;   // BLP header supports up to 16 mip levels
+
+    uint32_t mipOffsets[16];
+    uint32_t mipSizes[16];
+    for (int i = 0; i < 16; i++) { mipOffsets[i] = 0; mipSizes[i] = 0; }
+
+    size_t mw = w;
+    size_t mh = h;
+    size_t totalMipBytes = 0;
+    int mipCount = 0;
+    for (int level = 0; level < MAX_MIP_COUNT; level++) {
+        const size_t pixels = mw * mh;
+        const size_t bytes = pixels + pixels; // indices + alpha (8-bit each)
+        totalMipBytes += bytes;
+        mipCount++;
+        // Stop once we reach 1x1 (avoid repeating identical 1x1 mips for small textures)
+        if (mw == 1 && mh == 1) break;
+        // Next level dims (ceil half, but clamp to 1)
+        mw = std::max((size_t)1, (mw + 1) / 2);
+        mh = std::max((size_t)1, (mh + 1) / 2);
+    }
+
+    // Assemble output buffer
+    const size_t outSize = HEADER_SIZE + PALETTE_BYTES + totalMipBytes;
+    uint8_t *out = (uint8_t *)malloc(outSize);
+    if (!out) {
+        free(palette); free(indices); free(alpha);
+        return FAIL;
+    }
+
     // Build BLP1 header (156 bytes)
-    const size_t HEADER_SIZE = 156;
     uint8_t header[HEADER_SIZE];
     memset(header, 0, sizeof(header));
     header[0] = 'B'; header[1] = 'L'; header[2] = 'P'; header[3] = '1';
@@ -300,27 +457,80 @@ ENCODER_FN(Blp) {
     writeUInt32LE(header, 12, (uint32_t)w);
     writeUInt32LE(header, 16, (uint32_t)h);
     writeUInt32LE(header, 20, 0);          // extra
-    writeUInt32LE(header, 24, 0);          // hasMipmaps = 0
+    writeUInt32LE(header, 24, (mipCount > 1) ? 1u : 0u); // hasMipmaps
 
-    const uint32_t pixelDataOffset = (uint32_t)(HEADER_SIZE + 256 * 4);
-    const uint32_t pixelDataSize = (uint32_t)(n + n); // indices + alpha
-    writeUInt32LE(header, 28, pixelDataOffset); // mip0 offset
-    writeUInt32LE(header, 28 + 64, pixelDataSize); // mip0 size
+    // Palette block
+    memcpy(out, header, HEADER_SIZE);
+    memset(out + HEADER_SIZE, 0, PALETTE_BYTES);
+    memcpy(out + HEADER_SIZE, palette, paletteSize * 4);
 
-    // Assemble output buffer
-    const size_t outSize = HEADER_SIZE + 256 * 4 + n + n;
-    uint8_t *out = (uint8_t *)malloc(outSize);
-    if (!out) {
-        free(palette); free(indices); free(alpha);
-        return FAIL;
+    // Write mip data sequentially and record offsets/sizes
+    uint32_t writeOffset = (uint32_t)(HEADER_SIZE + PALETTE_BYTES);
+    mw = w; mh = h;
+
+    // mip0 (already computed by quantize_kmeans)
+    {
+        const size_t pixels = mw * mh;
+        const uint32_t bytes = (uint32_t)(pixels + pixels);
+        mipOffsets[0] = writeOffset;
+        mipSizes[0] = bytes;
+        memcpy(out + writeOffset, indices, pixels);
+        memcpy(out + writeOffset + (uint32_t)pixels, alpha, pixels);
+        writeOffset += bytes;
     }
 
-    memcpy(out, header, HEADER_SIZE);
-    // Palette: if paletteSize < 256, remaining bytes are already zero-initialized
-    memset(out + HEADER_SIZE, 0, 256 * 4);
-    memcpy(out + HEADER_SIZE, palette, paletteSize * 4);
-    memcpy(out + HEADER_SIZE + 256 * 4, indices, n);
-    memcpy(out + HEADER_SIZE + 256 * 4 + n, alpha, n);
+    // mip1..: downsample + map using same palette (no dithering for stability)
+    PixelArray prevOwned;
+    prevOwned.data = NULL; prevOwned.width = prevOwned.height = 0; prevOwned.type = EMPTY;
+    bool hasPrevOwned = false;
+    const PixelArray *prev = input;
+
+    for (int level = 1; level < mipCount; level++) {
+        mw = std::max((size_t)1, (mw + 1) / 2);
+        mh = std::max((size_t)1, (mh + 1) / 2);
+
+        PixelArray cur;
+        cur.data = NULL; cur.width = cur.height = 0; cur.type = EMPTY;
+        if (cur.Malloc(mw, mh) != SUCCESS) {
+            if (hasPrevOwned) prevOwned.Free();
+            free(out);
+            free(palette); free(indices); free(alpha);
+            return FAIL;
+        }
+
+        if (downsample2x2SeparateAlpha(prev, &cur) != SUCCESS) {
+            cur.Free();
+            if (hasPrevOwned) prevOwned.Free();
+            free(out);
+            free(palette); free(indices); free(alpha);
+            return FAIL;
+        }
+
+        const size_t pixels = mw * mh;
+        const uint32_t bytes = (uint32_t)(pixels + pixels);
+        mipOffsets[level] = writeOffset;
+        mipSizes[level] = bytes;
+
+        uint8_t *idxDst = out + writeOffset;
+        uint8_t *aDst = out + writeOffset + (uint32_t)pixels;
+        mapToPaletteNoDither(&cur, lut64, idxDst, aDst);
+        writeOffset += bytes;
+
+        // Advance chain
+        if (hasPrevOwned) prevOwned.Free();
+        prevOwned = cur;
+        hasPrevOwned = true;
+        prev = &prevOwned;
+        cur.data = NULL; cur.width = cur.height = 0; cur.type = EMPTY;
+    }
+
+    if (hasPrevOwned) prevOwned.Free();
+
+    // Fill header mip tables (16 entries)
+    for (int i = 0; i < 16; i++) {
+        writeUInt32LE(out, 28 + (size_t)i * 4, mipOffsets[i]);
+        writeUInt32LE(out, 28 + 64 + (size_t)i * 4, mipSizes[i]);
+    }
 
     // Assign to output
     output->data = out;
