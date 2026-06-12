@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#include <unordered_map>
 #include <algorithm>
 #include <cmath>
 
@@ -35,47 +36,48 @@ static inline int lutIndex64(int r6, int g6, int b6) {
     return (r6 << 12) | (g6 << 6) | b6;
 }
 
-static void buildLut64FromPalette(const uint8_t *palette /* 256*4 BGRA */, size_t paletteSize,
-                                 std::vector<RgbF> &paletteRgb,
-                                 std::vector<uint8_t> &lut /* 64^3 */) {
-    paletteRgb.clear();
-    paletteRgb.reserve(std::max((size_t)1, paletteSize));
+// Memoized nearest-palette lookup at 6-bit/channel precision. Entries are
+// computed on demand at the bucket midpoint, which yields the exact same
+// mapping as the previous eagerly-built 64^3 LUT, without paying the
+// 64^3 * paletteSize brute-force cost (~67M distance evals) per texture.
+struct LazyPaletteLut {
+    std::vector<RgbF> palette;
+    std::vector<uint8_t> lut;    // 64^3 entries
+    std::vector<uint8_t> known;  // 64^3 computed flags
 
-    size_t count = paletteSize;
-    if (count == 0) count = 1;
-    for (size_t i = 0; i < count; i++) {
-        size_t p = i * 4;
-        const float b = (float)palette[p + 0];
-        const float g = (float)palette[p + 1];
-        const float r = (float)palette[p + 2];
-        paletteRgb.push_back(RgbF{ r, g, b });
+    void init(const std::vector<RgbF> &paletteRgb) {
+        palette = paletteRgb;
+        if (palette.empty()) palette.push_back(RgbF{0, 0, 0});
+        static const int LUT_SIZE = 64 * 64 * 64;
+        lut.assign(LUT_SIZE, 0);
+        known.assign(LUT_SIZE, 0);
     }
 
-    static const int LUTN = 64; // 6 bits/channel
-    const int LUT_SIZE = LUTN * LUTN * LUTN;
-    lut.assign(LUT_SIZE, 0);
-
-    for (int rr = 0; rr < LUTN; rr++) {
-        float r_srgb = (float)((rr << 2) | 2); // bucket midpoint in 0..255
-        for (int gg = 0; gg < LUTN; gg++) {
-            float g_srgb = (float)((gg << 2) | 2);
-            for (int bb = 0; bb < LUTN; bb++) {
-                float b_srgb = (float)((bb << 2) | 2);
-                int best = 0;
-                float bestD = 1e30f;
-                for (size_t k = 0; k < paletteRgb.size(); k++) {
-                    const auto &c = paletteRgb[k];
-                    float d = dist2_srgb(r_srgb, g_srgb, b_srgb, c.r, c.g, c.b);
-                    if (d < bestD) { bestD = d; best = (int)k; }
-                }
-                lut[lutIndex64(rr, gg, bb)] = (uint8_t)best;
+    inline uint8_t lookup(int r8, int g8, int b8) {
+        const int r6 = r8 >> 2;
+        const int g6 = g8 >> 2;
+        const int b6 = b8 >> 2;
+        const int li = lutIndex64(r6, g6, b6);
+        if (!known[li]) {
+            const float r_srgb = (float)((r6 << 2) | 2); // bucket midpoint in 0..255
+            const float g_srgb = (float)((g6 << 2) | 2);
+            const float b_srgb = (float)((b6 << 2) | 2);
+            int best = 0;
+            float bestD = 1e30f;
+            for (size_t k = 0; k < palette.size(); k++) {
+                const auto &c = palette[k];
+                float d = dist2_srgb(r_srgb, g_srgb, b_srgb, c.r, c.g, c.b);
+                if (d < bestD) { bestD = d; best = (int)k; }
             }
+            lut[li] = (uint8_t)best;
+            known[li] = 1;
         }
+        return lut[li];
     }
-}
+};
 
-static void mapToPaletteNoDither(PixelArray *input,
-                                const std::vector<uint8_t> &lut /* 64^3 */,
+static void mapToPaletteNoDither(const PixelArray *input,
+                                LazyPaletteLut &lut,
                                 uint8_t *indices /* width*height */,
                                 uint8_t *alpha /* width*height */) {
     const size_t w = input->width;
@@ -85,10 +87,7 @@ static void mapToPaletteNoDither(PixelArray *input,
         for (size_t x = 0; x < w; x++) {
             Pixel p = row[x];
             alpha[y * w + x] = p.A;
-            const int r6 = ((int)p.R) >> 2;
-            const int g6 = ((int)p.G) >> 2;
-            const int b6 = ((int)p.B) >> 2;
-            indices[y * w + x] = lut[lutIndex64(r6, g6, b6)];
+            indices[y * w + x] = lut.lookup(p.R, p.G, p.B);
         }
     }
 }
@@ -138,30 +137,23 @@ static ImageState downsample2x2SeparateAlpha(const PixelArray *src, PixelArray *
     return SUCCESS;
 }
 
-// High-quality, fast quantization: k-means on sampled pixels + 5-5-5 LUT mapping
-// - Operates in linear RGB for perceptual accuracy (convert from sRGB)
-// - Sample up to SAMPLE_MAX non-transparent pixels
-// - Run limited-iteration k-means (K<=256)
-// - Build 32x32x32 (5 bits/channel) LUT for fast full-frame mapping
-static inline float srgbToLinear(float c01) {
-    // c01 in [0,1]
-    if (c01 <= 0.04045f) return c01 / 12.92f;
-    return powf((c01 + 0.055f) / 1.055f, 2.4f);
-}
-
-static inline uint8_t linearToSrgb8(float cLin) {
-    // clamp
-    if (cLin < 0.0f) cLin = 0.0f; else if (cLin > 1.0f) cLin = 1.0f;
-    float c;
-    if (cLin <= 0.0031308f) c = 12.92f * cLin; else c = 1.055f * powf(cLin, 1.0f / 2.4f) - 0.055f;
-    int v = (int)floorf(c * 255.0f + 0.5f);
-    if (v < 0) v = 0; else if (v > 255) v = 255;
-    return (uint8_t)v;
-}
+// Quantization strategy:
+// - Pass 1 scans all pixels once: fills the alpha plane, detects whether the
+//   image already fits an exact <=256-color palette, and accumulates an
+//   alpha-weighted 5-bit/channel histogram (32^3 buckets).
+// - Exact path (<=256 unique colors, the common case for textures that were
+//   palettized BLPs originally): the unique colors become the palette and
+//   mip0 indices are an exact per-color mapping. No k-means, no dithering
+//   (the representation is exact, so diffusion error would be zero anyway).
+// - Otherwise: weighted k-means over the non-empty histogram bucket means
+//   (typically a few thousand points instead of up to 200k pixel samples),
+//   then Floyd-Steinberg dithering of mip0 via the memoized palette LUT.
 static void quantize_kmeans(PixelArray *input,
                             uint8_t *palette /* 256*4 BGRA */, size_t *paletteSize,
                             uint8_t *indices /* width*height */,
-                            uint8_t *alpha /* width*height */) {
+                            uint8_t *alpha /* width*height */,
+                            std::vector<RgbF> &paletteRgbOut,
+                            LazyPaletteLut &lazyLut) {
     const size_t w = input->width;
     const size_t h = input->height;
     const size_t n = w * h;
@@ -175,34 +167,99 @@ static void quantize_kmeans(PixelArray *input,
         return WR * dr * dr + WG * dg * dg + WB * db * db;
     };
 
-    const size_t SAMPLE_MAX = 200000; // balance quality/speed
-    const int MAX_ITERS = 12;         // a bit more for better convergence
+    // --- Pass 1: alpha plane + exact-color map + histogram -----------------
+    std::unordered_map<uint32_t, uint8_t> exactMap; // 24-bit RGB -> palette index
+    exactMap.reserve(512);
+    bool exactOk = true;
 
-    struct SColor { float r, g, b, w; };
-    std::vector<SColor> samples; // sRGB in [0..255], w = alpha weight [0..1]
-    samples.reserve(std::min(n, SAMPLE_MAX));
+    static const int HIST_BITS = 5;
+    static const int HIST_N = 1 << HIST_BITS;             // 32
+    static const int HIST_SIZE = HIST_N * HIST_N * HIST_N; // 32768
+    std::vector<float> histR(HIST_SIZE, 0.0f), histG(HIST_SIZE, 0.0f), histB(HIST_SIZE, 0.0f), histW(HIST_SIZE, 0.0f);
+    bool anyVisible = false;
 
-    // Fill alpha buffer and gather samples (skip fully transparent)
-    size_t step = n > SAMPLE_MAX ? (n / SAMPLE_MAX) : 1;
-    size_t idx = 0;
     for (size_t y = 0; y < h; y++) {
         Pixel *row = input->data[y];
-        for (size_t x = 0; x < w; x++, idx++) {
+        for (size_t x = 0; x < w; x++) {
             Pixel p = row[x];
             alpha[y * w + x] = p.A;
-            if ((idx % step) == 0 && p.A > 0) {
-                float wgt = (float)p.A / 255.0f; // emphasize visible colours
-                samples.push_back(SColor{ (float)p.R, (float)p.G, (float)p.B, wgt });
+
+            if (exactOk) {
+                const uint32_t key = ((uint32_t)p.R << 16) | ((uint32_t)p.G << 8) | (uint32_t)p.B;
+                auto it = exactMap.find(key);
+                if (it == exactMap.end()) {
+                    if (exactMap.size() >= 256) {
+                        exactOk = false;
+                    } else {
+                        exactMap.emplace(key, (uint8_t)exactMap.size());
+                    }
+                }
+            }
+
+            if (p.A > 0) {
+                anyVisible = true;
+                const float wgt = (float)p.A / 255.0f; // emphasize visible colours
+                const int hi = (((int)p.R >> (8 - HIST_BITS)) << (2 * HIST_BITS))
+                             | (((int)p.G >> (8 - HIST_BITS)) << HIST_BITS)
+                             | ((int)p.B >> (8 - HIST_BITS));
+                histR[hi] += (float)p.R * wgt;
+                histG[hi] += (float)p.G * wgt;
+                histB[hi] += (float)p.B * wgt;
+                histW[hi] += wgt;
             }
         }
     }
 
-    if (samples.empty()) {
+    // --- Exact path ---------------------------------------------------------
+    if (exactOk && !exactMap.empty()) {
+        size_t count = exactMap.size();
+        paletteRgbOut.clear();
+        paletteRgbOut.resize(count);
+        for (const auto &kv : exactMap) {
+            const uint8_t r8 = (uint8_t)((kv.first >> 16) & 0xFF);
+            const uint8_t g8 = (uint8_t)((kv.first >> 8) & 0xFF);
+            const uint8_t b8 = (uint8_t)(kv.first & 0xFF);
+            const size_t p = (size_t)kv.second * 4;
+            palette[p + 0] = b8;
+            palette[p + 1] = g8;
+            palette[p + 2] = r8;
+            palette[p + 3] = 0xFF;
+            paletteRgbOut[kv.second] = RgbF{ (float)r8, (float)g8, (float)b8 };
+        }
+        *paletteSize = count;
+        lazyLut.init(paletteRgbOut);
+
+        for (size_t y = 0; y < h; y++) {
+            Pixel *row = input->data[y];
+            for (size_t x = 0; x < w; x++) {
+                Pixel p = row[x];
+                const uint32_t key = ((uint32_t)p.R << 16) | ((uint32_t)p.G << 8) | (uint32_t)p.B;
+                indices[y * w + x] = exactMap.find(key)->second;
+            }
+        }
+        return;
+    }
+
+    if (!anyVisible) {
         // Fallback: single black color
         palette[0] = palette[1] = palette[2] = 0; palette[3] = 0xFF;
         *paletteSize = 1;
         memset(indices, 0, n);
+        paletteRgbOut.clear();
+        paletteRgbOut.push_back(RgbF{0, 0, 0});
+        lazyLut.init(paletteRgbOut);
         return;
+    }
+
+    // --- K-means over histogram bucket means --------------------------------
+    struct SColor { float r, g, b, w; };
+    std::vector<SColor> samples;
+    samples.reserve(4096);
+    for (int hi = 0; hi < HIST_SIZE; hi++) {
+        const float wgt = histW[hi];
+        if (wgt <= 0.0f) continue;
+        const float inv = 1.0f / wgt;
+        samples.push_back(SColor{ histR[hi] * inv, histG[hi] * inv, histB[hi] * inv, wgt });
     }
 
     size_t K = std::min((size_t)256, samples.size());
@@ -232,9 +289,9 @@ static void quantize_kmeans(PixelArray *input,
         }
     }
 
+    const int MAX_ITERS = 12;
     std::vector<float> counts(K, 0.0f);
     std::vector<CColor> sums(K, CColor{0,0,0});
-    std::vector<uint16_t> assign(samples.size(), 0);
 
     for (int it = 0; it < MAX_ITERS; it++) {
         std::fill(counts.begin(), counts.end(), 0.0f);
@@ -248,30 +305,38 @@ static void quantize_kmeans(PixelArray *input,
                 float d = dist2(p.r, p.g, p.b, centers[k].r, centers[k].g, centers[k].b);
                 if (d < bestD) { bestD = d; bestK = k; }
             }
-            assign[i] = (uint16_t)bestK;
             float wgt = p.w;
             counts[bestK] += wgt;
             sums[bestK].r += p.r * wgt; sums[bestK].g += p.g * wgt; sums[bestK].b += p.b * wgt;
         }
 
         // Update
+        float maxShift2 = 0.0f;
         for (size_t k = 0; k < K; k++) {
             if (counts[k] <= 1e-6f) {
                 // Re-seed an empty center deterministically
                 size_t s = (k * 9973) % samples.size();
                 centers[k].r = samples[s].r; centers[k].g = samples[s].g; centers[k].b = samples[s].b;
+                maxShift2 = 1e30f;
             } else {
                 float inv = 1.0f / counts[k];
-                centers[k].r = sums[k].r * inv;
-                centers[k].g = sums[k].g * inv;
-                centers[k].b = sums[k].b * inv;
+                float nr = sums[k].r * inv;
+                float ng = sums[k].g * inv;
+                float nb = sums[k].b * inv;
+                float shift2 = dist2(nr, ng, nb, centers[k].r, centers[k].g, centers[k].b);
+                if (shift2 > maxShift2) maxShift2 = shift2;
+                centers[k].r = nr;
+                centers[k].g = ng;
+                centers[k].b = nb;
             }
         }
+        if (maxShift2 < 0.25f) break; // converged
     }
 
     // Build palette (BGRA) from non-empty clusters
     size_t paletteCount = 0;
-    std::vector<CColor> paletteRgb; paletteRgb.reserve(256);
+    paletteRgbOut.clear();
+    paletteRgbOut.reserve(256);
     for (size_t k = 0; k < K && paletteCount < 256; k++) {
         if (counts[k] <= 1e-6f) continue;
         uint8_t r8 = (uint8_t)std::min(255.0f, std::max(0.0f, centers[k].r));
@@ -282,35 +347,16 @@ static void quantize_kmeans(PixelArray *input,
         palette[p + 1] = g8;
         palette[p + 2] = r8;
         palette[p + 3] = 0xFF;
-        paletteRgb.push_back(CColor{ (float)r8, (float)g8, (float)b8 });
+        paletteRgbOut.push_back(RgbF{ (float)r8, (float)g8, (float)b8 });
         paletteCount++;
     }
     if (paletteCount == 0) {
         palette[0]=palette[1]=palette[2]=0; palette[3]=0xFF; paletteCount = 1;
-        paletteRgb.push_back(CColor{0,0,0});
+        paletteRgbOut.push_back(RgbF{0,0,0});
     }
+    *paletteSize = paletteCount;
 
-    // Build high-resolution LUT (64x64x64) to speed up nearest search in mapping
-    static const int LUTN = 64; // 6 bits/channel
-    const int LUT_SIZE = LUTN * LUTN * LUTN;
-    std::vector<uint8_t> lut(LUT_SIZE);
-    auto lutIndex = [](int r, int g, int b){ return (r<<12) | (g<<6) | b; };
-    for (int rr = 0; rr < LUTN; rr++) {
-        float r_srgb = (float)((rr<<2) | 2); // bucket midpoint in 0..255
-        for (int gg = 0; gg < LUTN; gg++) {
-            float g_srgb = (float)((gg<<2) | 2);
-            for (int bb = 0; bb < LUTN; bb++) {
-                float b_srgb = (float)((bb<<2) | 2);
-                int best = 0; float bestD = 1e30f;
-                for (size_t k = 0; k < paletteRgb.size(); k++) {
-                    const auto &c = paletteRgb[k];
-                    float d = dist2(r_srgb, g_srgb, b_srgb, c.r, c.g, c.b);
-                    if (d < bestD) { bestD = d; best = (int)k; }
-                }
-                lut[lutIndex(rr,gg,bb)] = (uint8_t)best;
-            }
-        }
-    }
+    lazyLut.init(paletteRgbOut);
 
     // Map all pixels with Floyd–Steinberg error diffusion (serpentine)
     std::vector<float> errR(w + 2, 0.0f), errG(w + 2, 0.0f), errB(w + 2, 0.0f);
@@ -326,11 +372,11 @@ static void quantize_kmeans(PixelArray *input,
                 float g = std::min(255.0f, std::max(0.0f, (float)p.G + errG[x + 1]));
                 float b = std::min(255.0f, std::max(0.0f, (float)p.B + errB[x + 1]));
 
-                // Nearest via LUT
-                int best = lut[lutIndex((int)r >> 2, (int)g >> 2, (int)b >> 2)];
+                // Nearest via memoized LUT
+                int best = lazyLut.lookup((int)r, (int)g, (int)b);
                 indices[y * w + x] = (uint8_t)best;
 
-                const auto &qc = paletteRgb[best];
+                const auto &qc = paletteRgbOut[best];
                 float er = (r - qc.r) * a;
                 float eg = (g - qc.g) * a;
                 float eb = (b - qc.b) * a;
@@ -351,10 +397,10 @@ static void quantize_kmeans(PixelArray *input,
                 float g = std::min(255.0f, std::max(0.0f, (float)p.G + errG[x + 1]));
                 float b = std::min(255.0f, std::max(0.0f, (float)p.B + errB[x + 1]));
 
-                int best = lut[lutIndex((int)r >> 2, (int)g >> 2, (int)b >> 2)];
+                int best = lazyLut.lookup((int)r, (int)g, (int)b);
                 indices[y * w + x] = (uint8_t)best;
 
-                const auto &qc = paletteRgb[best];
+                const auto &qc = paletteRgbOut[best];
                 float er = (r - qc.r) * a;
                 float eg = (g - qc.g) * a;
                 float eb = (b - qc.b) * a;
@@ -374,8 +420,6 @@ static void quantize_kmeans(PixelArray *input,
         std::fill(nextErrG.begin(), nextErrG.end(), 0.0f);
         std::fill(nextErrB.begin(), nextErrB.end(), 0.0f);
     }
-
-    *paletteSize = paletteCount;
 }
 
 DECODER_FN(Blp) {
@@ -406,12 +450,9 @@ ENCODER_FN(Blp) {
     }
 
     size_t paletteSize = 0;
-    quantize_kmeans(input, palette, &paletteSize, indices, alpha);
-
-    // Build palette LUT once, reuse for all mip levels
     std::vector<RgbF> paletteRgb;
-    std::vector<uint8_t> lut64;
-    buildLut64FromPalette(palette, paletteSize, paletteRgb, lut64);
+    LazyPaletteLut lut64;
+    quantize_kmeans(input, palette, &paletteSize, indices, alpha, paletteRgb, lut64);
 
     // Plan mip sizes and compute total output size.
     // Important: for POT textures, WebGL/OpenGL require a complete mip chain down to 1x1 when using mipmapped minification.
@@ -544,5 +585,3 @@ ENCODER_FN(Blp) {
 }
 
 #endif // HAVE_BLP
-
-
