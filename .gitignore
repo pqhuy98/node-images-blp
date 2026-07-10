@@ -17,6 +17,8 @@ tmp.*
 dev
 Makefile
 build
+standalone/build-msvc/
+standalone/build-gcc/
 third/*.bz2
 third/*.gz
 
